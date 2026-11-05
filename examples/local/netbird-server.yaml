@@ -1,0 +1,22 @@
+# The self-hosted NetBird server CI joins: management, signal, relay and
+# STUN in NetBird's combined server, so a real join needs no account or key
+# from outside the run. Plain HTTP and throwaway secrets, for CI only.
+server:
+  listenAddress: ":80"
+  exposedAddress: "http://10.88.0.226:80"
+  stunPorts:
+    - 3478
+  healthcheckAddress: ":9000"
+  logLevel: "info"
+  logFile: "console"
+  authSecret: "ci-only-relay-secret-0123456789abcdef"
+  dataDir: "/var/lib/netbird"
+  auth:
+    issuer: "http://10.88.0.226/oauth2"
+    signKeyRefreshEnabled: true
+    dashboardRedirectURIs:
+      - "http://10.88.0.226/nb-auth"
+    cliRedirectURIs:
+      - "http://localhost:53000/"
+  store:
+    engine: "sqlite"

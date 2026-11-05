@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Conn3x
+        env: &gh
+          GH_TOKEN: ${{ github.token }}
+        run: &install |
+          tag=$(gh release view -R conn3xorg/conn3x --json tagName -q .tagName)
+          file="conn3x_${tag#v}_linux_amd64.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/$file"
+          curl -sSfLO "https://github.com/conn3xorg/conn3x/releases/download/$tag/checksums.txt"
+          grep " $file\$" checksums.txt | sha256sum -c -
+          mkdir -p bin && tar -xzf "$file" -C bin conn3x
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: conn3x version
+      - run: conn3x fmt -check -recursive
+      - name: Validate
+        run: conn3x init -backend=false && conn3x validate
+      - name: Validate the example
+        working-directory: examples/local
+        run: conn3x init -backend=false && conn3x validate
+
+  e2e:
+    needs: validate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [rocky10, fedora45, ubuntu2404, debian13]
+    name: e2e (${{ matrix.distro }})
+    env:
+      # The self-hosted server CI joins, and the client image the second peer
+      # runs, both by digest.
+      SERVER_IMAGE: docker.io/netbirdio/netbird-server:0.82.0@sha256:7b5b53b2dc8bc25639f791cf72d47cf86911894ff3f8a97cb79bab9be958109c
+      CLIENT_IMAGE: docker.io/netbirdio/netbird:0.82.0@sha256:eca5b274c635bfbb04ec6724a0712d1146190dd450eea199eeb83916fdd94965
+      SERVER: http://10.88.0.226:80
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The test host images live in the Conn3x repo.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: conn3xorg/conn3x
+          ref: main
+          path: conn3x
+          persist-credentials: false
+          sparse-checkout: test/images
+      - name: Install Conn3x
+        env: *gh
+        run: *install
+      - name: Start the ${{ matrix.distro }} host
+        working-directory: examples/local
+        env:
+          CONTAINERFILE: ${{ github.workspace }}/conn3x/test/images/${{ matrix.distro }}/Containerfile
+          # netbird needs /dev/net/tun, so the host container is rootful and privileged.
+          PODMAN: sudo podman
+        run: ./up.sh
+      # A self-hosted NetBird server, its first user and a setup key, made
+      # through NetBird's setup API. The client image's wget does the asking.
+      - name: Start a NetBird server and make a setup key
+        working-directory: examples/local
+        run: |
+          sudo podman run --rm -d --name circuit-netbird-server --ip 10.88.0.226 --tmpfs /var/lib/netbird \
+            -e NB_SETUP_PAT_ENABLED=true -v "$PWD/netbird-server.yaml:/etc/netbird/config.yaml:ro" \
+            "$SERVER_IMAGE" --config /etc/netbird/config.yaml
+          api() { sudo podman run --rm --entrypoint wget "$CLIENT_IMAGE" -qO- --header 'Content-Type: application/json' "$@"; }
+          for _ in $(seq 60); do
+            if setup=$(api --post-data '{"email":"ci@example.com","name":"CI","password":"ci-only-Passw0rd!","create_pat":true}' "$SERVER/api/setup"); then break; fi
+            sleep 2
+          done
+          pat=$(echo "$setup" | sed -n 's/.*"personal_access_token":"\([^"]*\)".*/\1/p')
+          echo "::add-mask::$pat"
+          api --header "Authorization: Token $pat" --post-data '{"name":"ci","type":"reusable","expires_in":86400,"auto_groups":[],"usage_limit":0}' \
+            "$SERVER/api/setup-keys" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p' > setup-key
+          echo "::add-mask::$(cat setup-key)"
+          [ -s setup-key ]
+      - name: Join with the previous release, then plan again with no changes
+        working-directory: examples/local
+        run: |
+          export TF_VAR_setup_key="$(cat setup-key)"
+          args=(-var join=true -var management_url="$SERVER" -var netbird_version=0.81.5)
+          conn3x init
+          conn3x apply -auto-approve "${args[@]}"
+          conn3x plan -detailed-exitcode "${args[@]}"
+      # A second peer joins with the same key and pings the host over the
+      # network: the host is logged in, and traffic really gets through.
+      - name: Reach the host across the network from a second peer
+        working-directory: examples/local
+        run: |
+          sudo podman exec circuit-netbird netbird status --json | grep -q '"daemonStatus":"Connected"'
+          sudo podman run --rm -d --name circuit-netbird-peer --privileged -e NB_SETUP_KEY="$(cat setup-key)" \
+            -e NB_MANAGEMENT_URL="$SERVER" -e NB_HOSTNAME=peer "$CLIENT_IMAGE"
+          address=$(sudo podman exec circuit-netbird netbird status --json | sed -n 's/.*"netbirdIp":"\([0-9.]*\)\/.*/\1/p')
+          echo "$address" > netbird-ip
+          for _ in $(seq 30); do
+            if sudo podman exec circuit-netbird-peer ping -c 1 -W 5 "$address"; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Upgrade to the current release, then reach the host again
+        working-directory: examples/local
+        run: |
+          export TF_VAR_setup_key="$(cat setup-key)"
+          args=(-var join=true -var management_url="$SERVER")
+          conn3x apply -auto-approve "${args[@]}"
+          conn3x plan -detailed-exitcode "${args[@]}"
+          sudo podman exec circuit-netbird netbird version | grep -qx 0.82.0
+          for _ in $(seq 30); do
+            if sudo podman exec circuit-netbird-peer ping -c 1 -W 5 "$(cat netbird-ip)"; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      # The key reaches the host write-only, so state holds none of it, and
+      # nothing Conn3x writes under .terraform does either. .terraform/modules
+      # is left out: it holds downloaded module code.
+      - name: Check the setup key stays out of state
+        working-directory: examples/local
+        run: |
+          if grep -rqF --exclude-dir=modules -e "$(cat setup-key)" terraform.tfstate .terraform/; then
+            echo "The setup key is in terraform.tfstate or under .terraform/." >&2
+            exit 1
+          fi
+      # Restarting the container boots systemd again, so this checks the
+      # client is enabled and reconnects on its own.
+      - name: Restart the host, then reach it again
+        working-directory: examples/local
+        run: |
+          sudo podman restart circuit-netbird
+          for _ in $(seq 60); do
+            case $(sudo podman exec circuit-netbird systemctl is-system-running 2>/dev/null) in running|degraded) break ;; esac
+            sleep 1
+          done
+          sudo podman exec circuit-netbird systemctl is-active netbird
+          for _ in $(seq 60); do
+            if sudo podman exec circuit-netbird-peer ping -c 1 -W 5 "$(cat netbird-ip)"; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Plan again after the restart, with no changes
+        working-directory: examples/local
+        run: |
+          export TF_VAR_setup_key="$(cat setup-key)"
+          conn3x plan -detailed-exitcode -var join=true -var management_url="$SERVER"
+      # Once joined, the host doesn't need the key: switching join off deletes
+      # it, and the host stays in the network.
+      - name: Switch join off, then reach the host again
+        working-directory: examples/local
+        run: |
+          conn3x apply -auto-approve -var management_url="$SERVER"
+          conn3x plan -detailed-exitcode -var management_url="$SERVER"
+          if sudo podman exec circuit-netbird test -e /etc/netbird/setup-key; then exit 1; fi
+          for _ in $(seq 30); do
+            if sudo podman exec circuit-netbird-peer ping -c 1 -W 5 "$(cat netbird-ip)"; then exit 0; fi
+            sleep 2
+          done
+          exit 1
+      - name: Stop the test network
+        if: always()
+        run: sudo podman stop circuit-netbird-peer circuit-netbird-server || true
+      - name: Clean up
+        if: always()
+        working-directory: examples/local
+        env:
+          PODMAN: sudo podman
+        run: ./down.sh
